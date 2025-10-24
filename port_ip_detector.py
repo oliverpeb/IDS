@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""
+port_ip_detector.py
+
+- Used by Port/IP Detector GUI.
+- Runs a lightweight IsolationForest on port + byte metrics to find anomalies.
+- Can optionally query VirusTotal for IP reputation (requires VT_API_KEY env var).
+- Saves results (restricted CSV + vt_results/ JSON).
+"""
+
+import os
+import time
+import json
+import ipaddress
+from typing import List, Dict
+
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
+import requests
+
+# ------------------ Config ------------------
+OUTPUT_ALERT_CSV = "port_ip_alerts.csv"
+VT_OUTDIR = "vt_results"
+VT_SLEEP_SEC = 15  # sleep between requests (for free VT tier)
+
+# ------------------ Helpers ------------------
+def pick_ip_column(df: pd.DataFrame) -> str:
+    """Return the ip-like column name if present."""
+    for c in [
+        "Destination IP", "Dst IP", "Destination Address", "Dst Addr",
+        "Destination IP Address", "IPaddress", "ip"
+    ]:
+        if c in df.columns:
+            return c
+    return None
+
+
+def is_public_ip(ip: str) -> bool:
+    """Return True if IP is globally routable (not private/reserved)."""
+    try:
+        ipobj = ipaddress.ip_address(ip)
+        return not (ipobj.is_private or ipobj.is_reserved or ipobj.is_loopback or ipobj.is_multicast)
+    except Exception:
+        return False
+
+# ------------------ Isolation Forest ------------------
+def detect_port_ip_anomalies(df_raw: pd.DataFrame, contamination: float = 0.02) -> pd.DataFrame:
+    """
+    Small IsolationForest on ['Port','Netflow_Bytes','file_entropy']
+    to flag odd port/throughput combos.
+    """
+    if df_raw is None or df_raw.empty:
+        return pd.DataFrame(columns=["Port","Netflow_Bytes","file_entropy","pi_anomaly"])
+
+    df = df_raw.copy()
+    # normalize column names
+    if "Destination Port" in df.columns and "Port" not in df.columns:
+        df = df.rename(columns={"Destination Port": "Port"})
+    if "Flow Bytes/s" in df.columns and "Netflow_Bytes" not in df.columns:
+        df = df.rename(columns={"Flow Bytes/s": "Netflow_Bytes"})
+    if "Netflow_Bytes" not in df.columns:
+        if {"Total Length of Fwd Packets","Total Length of Bwd Packets"}.issubset(df.columns):
+            df["Netflow_Bytes"] = pd.to_numeric(df["Total Length of Fwd Packets"], errors="coerce") + \
+                                   pd.to_numeric(df["Total Length of Bwd Packets"], errors="coerce")
+        else:
+            return pd.DataFrame(columns=["Port","Netflow_Bytes","file_entropy","pi_anomaly"])
+
+    for c in ["Port","Netflow_Bytes"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["file_entropy"] = np.log(df["Netflow_Bytes"].fillna(0) + 1)
+
+    feats = df[["Port","Netflow_Bytes","file_entropy"]].dropna().reset_index()
+    if feats.empty:
+        return pd.DataFrame(columns=["Port","Netflow_Bytes","file_entropy","pi_anomaly"])
+
+    scaler = StandardScaler()
+    X = scaler.fit_transform(feats[["Port","Netflow_Bytes","file_entropy"]])
+
+    if_model = IsolationForest(contamination=contamination, random_state=42)
+    preds = if_model.fit_predict(X)  # -1 anomaly, 1 normal
+
+    feats["pi_anomaly"] = preds
+    out = feats.merge(df.reset_index(), on="index", how="left", suffixes=("","_raw"))
+    return out[out["pi_anomaly"] == -1][["Port","Netflow_Bytes","file_entropy","pi_anomaly"]]
+
+# ------------------ VirusTotal (v3 API) ------------------
+def vt_lookup_ips(ips: List[str], api_key: str, outdir: str = VT_OUTDIR, sleep_sec: int = VT_SLEEP_SEC) -> Dict[str, dict]:
+    """
+    Query VirusTotal v3 /ip_addresses/<ip>
+    Returns dict ip -> result, saves to vt_results/ (JSON files + cumulative log).
+    """
+    os.makedirs(outdir, exist_ok=True)
+    headers = {"x-apikey": api_key}
+    base = "https://www.virustotal.com/api/v3/ip_addresses/{}"
+    results = {}
+    outfile = os.path.join(outdir, "vt_batch_results.json")
+
+    # resume existing
+    if os.path.exists(outfile):
+        try:
+            with open(outfile, "r") as f:
+                results = json.load(f)
+        except Exception:
+            results = {}
+
+    for i, ip in enumerate(ips):
+        if ip in results:
+            print(f"[VT] Skipping {ip} (cached)")
+            continue
+        if not is_public_ip(ip):
+            print(f"[VT] Skipping {ip} (non-public)")
+            results[ip] = {"skipped": True}
+            with open(outfile, "w") as f:
+                json.dump(results, f, indent=2)
+            continue
+        print(f"[VT] {i+1}/{len(ips)} -> {ip}")
+        try:
+            r = requests.get(base.format(ip), headers=headers, timeout=30)
+            if r.status_code == 200:
+                data = r.json()
+                results[ip] = {"ok": True, "data": data}
+                with open(os.path.join(outdir, f"{ip.replace(':','_')}.json"), "w") as f2:
+                    json.dump(data, f2)
+            else:
+                results[ip] = {"ok": False, "status": r.status_code, "text": r.text}
+            with open(outfile, "w") as f:
+                json.dump(results, f, indent=2)
+        except Exception as e:
+            results[ip] = {"ok": False, "error": str(e)}
+            with open(outfile, "w") as f:
+                json.dump(results, f, indent=2)
+        print(f"  - sleeping {sleep_sec}s to respect VT limits")
+        time.sleep(sleep_sec)
+    return results
+
+# ------------------ CLI / standalone mode ------------------
+def main(csv_path: str, contamination: float = 0.02, watch_ports: List[int] = None,
+         malicious_ips: List[str] = None, vt_lookup: bool = False):
+    """
+    Command-line entry: loads CSV, runs IsolationForest and optional VirusTotal lookups.
+    """
+    print("Loading CSV...")
+    df = pd.read_csv(csv_path, low_memory=False, encoding_errors="ignore")
+
+    # Normalize IP + port columns
+    ip_col = pick_ip_column(df)
+    if ip_col:
+        df = df.rename(columns={ip_col: "IPaddress"})
+        print(f"Detected IP column: {ip_col}")
+    else:
+        print("No IP column detected.")
+
+    if "Destination Port" in df.columns and "Port" not in df.columns:
+        df = df.rename(columns={"Destination Port": "Port"})
+    df["Port"] = pd.to_numeric(df.get("Port", pd.Series([-1]*len(df))), errors="coerce").fillna(-1).astype(int)
+
+    # Default watch ports
+    if watch_ports is None:
+        watch_ports = [443, 53, 80]
+
+    print(f"Running IsolationForest on ports/IP metrics (contamination={contamination})...")
+    anomalies = detect_port_ip_anomalies(df, contamination)
+    print(f"Detected {len(anomalies)} anomalies.")
+
+    # Watchlist filter
+    df_matches = df[df["Port"].isin(watch_ports)].copy()
+    if malicious_ips and "IPaddress" in df.columns:
+        df_matches = pd.concat([df_matches, df[df["IPaddress"].isin(malicious_ips)]], ignore_index=True)
+    df_matches.drop_duplicates(inplace=True)
+    print(f"Found {len(df_matches)} matches (watch ports or malicious IPs).")
+
+    # Save restricted CSV
+    if not df_matches.empty:
+        df_matches.to_csv(OUTPUT_ALERT_CSV, index=False)
+        print(f"Saved {OUTPUT_ALERT_CSV} (restricted raw data).")
+
+    # Optional VT enrichment
+    if vt_lookup:
+        api_key = os.getenv("VT_API_KEY")
+        if not api_key:
+            print("VT_API_KEY not set; skipping VirusTotal lookup.")
+        else:
+            ips = sorted(set(df_matches.get("IPaddress", []))) if "IPaddress" in df_matches.columns else []
+            if malicious_ips:
+                ips.extend(malicious_ips)
+            if ips:
+                print(f"Querying VT for {len(ips)} IPs...")
+                vt_lookup_ips(list(set(ips)), api_key=api_key, outdir=VT_OUTDIR, sleep_sec=VT_SLEEP_SEC)
+            else:
+                print("No public IPs to query in VT.")
+    print("Done.")
+
+# ------------------ CLI usage ------------------
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Port/IP Detector + optional VirusTotal enrichment")
+    parser.add_argument("csv", help="Path to flow CSV file")
+    parser.add_argument("--contam", type=float, default=0.02, help="IsolationForest contamination level")
+    parser.add_argument("--watch-ports", type=str, default="443,53,80",
+                        help="Comma-separated ports to watch (e.g., 443,22,53)")
+    parser.add_argument("--malicious-ips", type=str, default="", help="Comma-separated known malicious IPs (demo)")
+    parser.add_argument("--vt", action="store_true", help="Run VirusTotal lookups (requires VT_API_KEY env var)")
+    args = parser.parse_args()
+
+    ports = [int(p.strip()) for p in args.watch_ports.split(",") if p.strip()]
+    malicious = [ip.strip() for ip in args.malicious_ips.split(",") if ip.strip()]
+    main(args.csv, contamination=args.contam, watch_ports=ports, malicious_ips=malicious, vt_lookup=args.vt)
