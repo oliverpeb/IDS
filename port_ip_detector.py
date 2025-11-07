@@ -19,11 +19,13 @@ import pandas as pd
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
 import requests
+import joblib  # <-- for saving/loading model
 
 # ------------------ Config ------------------
 OUTPUT_ALERT_CSV = "port_ip_alerts.csv"
 VT_OUTDIR = "vt_results"
 VT_SLEEP_SEC = 15  # sleep between requests (for free VT tier)
+MODEL_PATH = "isolation_model.pkl"  # <-- saved IF + scaler
 
 # ------------------ Helpers ------------------
 def pick_ip_column(df: pd.DataFrame) -> str:
@@ -50,40 +52,76 @@ def detect_port_ip_anomalies(df_raw: pd.DataFrame, contamination: float = 0.02) 
     """
     Small IsolationForest on ['Port','Netflow_Bytes','file_entropy']
     to flag odd port/throughput combos.
+
+    Now with model persistence: tries to load a previously trained model+scaler
+    from disk; if not found or incompatible, trains a new one and saves it.
     """
     if df_raw is None or df_raw.empty:
-        return pd.DataFrame(columns=["Port","Netflow_Bytes","file_entropy","pi_anomaly"])
+        return pd.DataFrame(columns=["Port", "Netflow_Bytes", "file_entropy", "pi_anomaly"])
 
     df = df_raw.copy()
+
     # normalize column names
     if "Destination Port" in df.columns and "Port" not in df.columns:
         df = df.rename(columns={"Destination Port": "Port"})
     if "Flow Bytes/s" in df.columns and "Netflow_Bytes" not in df.columns:
         df = df.rename(columns={"Flow Bytes/s": "Netflow_Bytes"})
-    if "Netflow_Bytes" not in df.columns:
-        if {"Total Length of Fwd Packets","Total Length of Bwd Packets"}.issubset(df.columns):
-            df["Netflow_Bytes"] = pd.to_numeric(df["Total Length of Fwd Packets"], errors="coerce") + \
-                                   pd.to_numeric(df["Total Length of Bwd Packets"], errors="coerce")
-        else:
-            return pd.DataFrame(columns=["Port","Netflow_Bytes","file_entropy","pi_anomaly"])
 
-    for c in ["Port","Netflow_Bytes"]:
+    # derive Netflow_Bytes if missing
+    if "Netflow_Bytes" not in df.columns:
+        if {"Total Length of Fwd Packets", "Total Length of Bwd Packets"}.issubset(df.columns):
+            df["Netflow_Bytes"] = (
+                pd.to_numeric(df["Total Length of Fwd Packets"], errors="coerce")
+                + pd.to_numeric(df["Total Length of Bwd Packets"], errors="coerce")
+            )
+        else:
+            return pd.DataFrame(columns=["Port", "Netflow_Bytes", "file_entropy", "pi_anomaly"])
+
+    # ensure numerics
+    for c in ["Port", "Netflow_Bytes"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df["file_entropy"] = np.log(df["Netflow_Bytes"].fillna(0) + 1)
 
-    feats = df[["Port","Netflow_Bytes","file_entropy"]].dropna().reset_index()
+    # build feature frame (keep index to merge back)
+    feats = df[["Port", "Netflow_Bytes", "file_entropy"]].dropna().reset_index()
     if feats.empty:
-        return pd.DataFrame(columns=["Port","Netflow_Bytes","file_entropy","pi_anomaly"])
+        return pd.DataFrame(columns=["Port", "Netflow_Bytes", "file_entropy", "pi_anomaly"])
 
-    scaler = StandardScaler()
-    X = scaler.fit_transform(feats[["Port","Netflow_Bytes","file_entropy"]])
+    X_raw = feats[["Port", "Netflow_Bytes", "file_entropy"]].values
 
-    if_model = IsolationForest(contamination=contamination, random_state=42)
-    preds = if_model.fit_predict(X)  # -1 anomaly, 1 normal
+    # try to load existing model
+    loaded = False
+    if os.path.exists(MODEL_PATH):
+        try:
+            bundle = joblib.load(MODEL_PATH)
+            scaler = bundle["scaler"]
+            if_model = bundle["model"]
+            X = scaler.transform(X_raw)
+            preds = if_model.predict(X)
+            loaded = True
+        except Exception as e:
+            print(f"[ML] Failed to load existing model – retraining. Reason: {e}")
+            loaded = False
 
-    feats["pi_anomaly"] = preds
-    out = feats.merge(df.reset_index(), on="index", how="left", suffixes=("","_raw"))
-    return out[out["pi_anomaly"] == -1][["Port","Netflow_Bytes","file_entropy","pi_anomaly"]]
+    if not loaded:
+        # train new
+        scaler = StandardScaler()
+        X = scaler.fit_transform(X_raw)
+        if_model = IsolationForest(contamination=contamination, random_state=42)
+        if_model.fit(X)
+        # save both scaler and model
+        joblib.dump({"scaler": scaler, "model": if_model}, MODEL_PATH)
+        print(f"[ML] Trained new IsolationForest and saved to {MODEL_PATH}")
+        preds = if_model.predict(X)
+
+    # attach predictions
+    feats["pi_anomaly"] = preds  # -1 anomaly, 1 normal
+
+    # merge back to original df (to keep other columns, incl. IPs)
+    out = feats.merge(df.reset_index(), on="index", how="left", suffixes=("", "_raw"))
+
+    # return only anomalies (like before)
+    return out[out["pi_anomaly"] == -1][["Port", "Netflow_Bytes", "file_entropy", "pi_anomaly"]]
 
 # ------------------ VirusTotal (v3 API) ------------------
 def vt_lookup_ips(ips: List[str], api_key: str, outdir: str = VT_OUTDIR, sleep_sec: int = VT_SLEEP_SEC) -> Dict[str, dict]:
@@ -154,7 +192,7 @@ def main(csv_path: str, contamination: float = 0.02, watch_ports: List[int] = No
 
     if "Destination Port" in df.columns and "Port" not in df.columns:
         df = df.rename(columns={"Destination Port": "Port"})
-    df["Port"] = pd.to_numeric(df.get("Port", pd.Series([-1]*len(df))), errors="coerce").fillna(-1).astype(int)
+    df["Port"] = pd.to_numeric(df.get("Port", pd.Series([-1] * len(df))), errors="coerce").fillna(-1).astype(int)
 
     # Default watch ports
     if watch_ports is None:

@@ -1,4 +1,3 @@
-# gui_port_ip_qt.py
 import sys
 import os
 import json
@@ -12,7 +11,7 @@ from PyQt5.QtCore import Qt, pyqtSignal, QObject
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QFileDialog, QTableWidget, QTableWidgetItem, QLabel, QMessageBox, QTabWidget,
-    QLineEdit, QSplitter, QCheckBox, QMenu  # <<< added QMenu
+    QLineEdit, QSplitter, QCheckBox, QMenu
 )
 from PyQt5.QtGui import QColor
 
@@ -45,7 +44,15 @@ def _table_from_df(tbl: QTableWidget, df: pd.DataFrame, max_rows: int = 1500):
 
     for i, (_, row) in enumerate(df_show.iterrows()):
         highlight = None
-        if "vt_flag" in row and str(row["vt_flag"]).strip().lower() in ("1", "true", "yes"):
+        if "verdict" in row:
+            v = str(row["verdict"]).lower()
+            if v == "high":
+                highlight = QColor(255, 130, 130)
+            elif v == "medium":
+                highlight = QColor(255, 210, 160)
+            elif v == "low":
+                highlight = QColor(200, 255, 200)
+        elif "vt_flag" in row and str(row["vt_flag"]).strip().lower() in ("1", "true", "yes"):
             highlight = QColor(255, 160, 160)
         elif "Label" in row and str(row["Label"]).strip().upper() == "MALICIOUS":
             highlight = QColor(255, 210, 160)
@@ -106,6 +113,7 @@ class PortIPApp(QMainWindow):
         self.anoms_portip = pd.DataFrame()
         self.df_matches = pd.DataFrame()
 
+        # --- Top bar ---
         top = QWidget()
         tlay = QHBoxLayout(top)
         self.info = QLabel("Load a flow CSV (CIC-style).")
@@ -135,6 +143,7 @@ class PortIPApp(QMainWindow):
         tlay.addWidget(btn_load)
         tlay.addWidget(self.btn_run)
 
+        # --- Tabs ---
         tabs = QTabWidget()
 
         # Results tab
@@ -171,13 +180,12 @@ class PortIPApp(QMainWindow):
         split2.setSizes([600, 300])
         pilay.addWidget(split2)
 
-        # Matches tab
+        # Matches & VT tab
         tab_matches = QWidget()
         mlay = QVBoxLayout(tab_matches)
         self.lbl_matches = QLabel("Matches: 0")
         mlay.addWidget(self.lbl_matches)
         self.tbl_matches = QTableWidget()
-        # <<< added: enable context menu
         self.tbl_matches.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tbl_matches.customContextMenuRequested.connect(self.on_matches_context_menu)
         mlay.addWidget(self.tbl_matches)
@@ -210,7 +218,7 @@ class PortIPApp(QMainWindow):
         main.addWidget(tabs)
         self.setCentralWidget(root)
 
-    # -----------------------------------------
+    # ---------- Slots ----------
     def on_load(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open flow CSV", "", "CSV Files (*.csv);;All files (*.*)")
         if not path:
@@ -243,9 +251,10 @@ class PortIPApp(QMainWindow):
             return
         bad_ips = [x.strip() for x in self.edit_bad_ips.text().split(",") if x.strip()]
 
-        self.info.setText("Running detections… (this may take a moment)")
+        self.info.setText("Running detections…")
         QApplication.processEvents()
 
+        # 1) Main IsolationForest
         try:
             self.anoms_main = run_anomaly_detection(self.csv_path, contamination=contam)
         except Exception as e:
@@ -254,14 +263,18 @@ class PortIPApp(QMainWindow):
 
         cols = [c for c in ["Time", "Port", "Netflow_Bytes", "reasoning", "Time_hashed", "ip_hashed"] if c in self.anoms_main.columns]
         _table_from_df(self.tbl_anoms, self.anoms_main[cols] if cols else self.anoms_main)
-        self.lbl_summary.setText(f"File: {os.path.basename(self.csv_path)} | Main anomalies: {len(self.anoms_main)} | Contamination: {contam}")
+        self.lbl_summary.setText(
+            f"File: {os.path.basename(self.csv_path)} | Main anomalies: {len(self.anoms_main)} | Contamination: {contam}"
+        )
 
+        # Histogram
         self.ax_hist.clear()
         if len(self.anoms_main) and "Netflow_Bytes" in self.anoms_main.columns:
             pd.to_numeric(self.anoms_main["Netflow_Bytes"], errors="coerce").dropna().astype(float).plot.hist(bins=50, ax=self.ax_hist)
             self.ax_hist.set_title("Netflow_Bytes (anomalies)")
         self.canvas_hist.draw()
 
+        # 2) Port/IP-focused IF
         if detect_port_ip_anomalies is None:
             self.anoms_portip = pd.DataFrame()
             self.lbl_pi.setText("Port/IP-focused IsolationForest anomalies: 0 (module not found)")
@@ -274,6 +287,13 @@ class PortIPApp(QMainWindow):
             _table_from_df(self.tbl_pi, self.anoms_portip)
             self.lbl_pi.setText(f"Port/IP-focused IsolationForest anomalies: {len(self.anoms_portip)}")
 
+            # <<< ML model info (this is what you asked for)
+            if os.path.exists("isolation_model.pkl"):
+                self.info.setText("Reused existing trained IsolationForest model ✅")
+            else:
+                self.info.setText("Trained a new IsolationForest model 🧠")
+
+            # ports chart
             self.ax_ports.clear()
             if not self.anoms_portip.empty and "Port" in self.anoms_portip.columns:
                 top_ports = self.anoms_portip["Port"].value_counts().head(15).sort_values(ascending=False)
@@ -281,19 +301,18 @@ class PortIPApp(QMainWindow):
                 self.ax_ports.set_title("Top Ports among Port/IP anomalies")
             self.canvas_ports.draw()
 
+        # 3) Matches (watch ports / malicious IPs)
         dfm = self.df_full.copy()
         if "Port" in dfm.columns:
             dfm["Port"] = pd.to_numeric(dfm["Port"], errors="coerce").fillna(-1).astype(int)
             port_mask = dfm["Port"].isin(watch_ports)
         else:
             port_mask = pd.Series([False] * len(dfm))
-
         ip_col = _detect_ip_col(dfm)
         if bad_ips and ip_col:
             ip_mask = dfm[ip_col].astype(str).isin(bad_ips)
         else:
             ip_mask = pd.Series([False] * len(dfm))
-
         self.df_matches = dfm[port_mask | ip_mask].copy()
         self.lbl_matches.setText(f"Matches: {len(self.df_matches)} (watch ports or malicious IPs)")
         self.lbl_matches.setStyleSheet("")
@@ -334,7 +353,7 @@ class PortIPApp(QMainWindow):
         worker.signals.done.connect(self.vt_done)
         worker.signals.error.connect(self.vt_error)
         worker.start()
-        self._vt_worker = worker
+        self._vt_worker = worker  # keep reference
 
     def apply_vt_results_to_matches(self, results: dict):
         if self.df_matches is None or self.df_matches.empty:
@@ -374,14 +393,11 @@ class PortIPApp(QMainWindow):
         self.btn_vt.setText("Run VT on matches")
         QMessageBox.critical(self, "VT error", msg)
 
-    # <<< added: right-click menu on matches table
     def on_matches_context_menu(self, pos):
         sel = self.tbl_matches.selectedItems()
         if not sel:
             return
         row = sel[0].row()
-
-        # find IP-col
         cols = [self.tbl_matches.horizontalHeaderItem(i).text() for i in range(self.tbl_matches.columnCount())]
         ip_col_name = None
         for cand in ["Destination IP", "IPaddress", "Dst IP", "ip"]:
@@ -399,7 +415,6 @@ class PortIPApp(QMainWindow):
         menu = QMenu(self)
         act_vt = menu.addAction("Open in VirusTotal")
         act_copy = menu.addAction("Copy IP")
-
         action = menu.exec_(self.tbl_matches.viewport().mapToGlobal(pos))
         if action == act_vt and ip:
             url = f"https://www.virustotal.com/gui/ip-address/{ip}"
