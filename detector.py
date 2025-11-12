@@ -12,28 +12,35 @@ from sklearn.preprocessing import StandardScaler
 import joblib
 
 # ========= Config (base) =========
-SCALER_FILE = 'scaler.joblib'
-LOG_FILE = 'cumulative_alerts.json'
-AUDIT_FILE = 'gdpr_audit_log.csv'
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+SCALER_FILE = os.path.join(BASE_DIR, 'scaler.joblib')
+LOG_FILE = os.path.join(BASE_DIR, 'cumulative_alerts.json')
+AUDIT_FILE = os.path.join(BASE_DIR, 'gdpr_audit_log.csv')
+BASELINE_FILE = os.path.join(BASE_DIR, 'baseline_history.csv')
 
 CHUNK_SIZE = 200
 DEFAULT_CONTAM = 0.02
 FEATURES = ['Time_numeric', 'Netflow_Bytes', 'Port']
-SALT = b"your_project_salt_2025"  # demo salt
+SALT = b"your_project_salt_2025"
+MAX_BASELINE_ROWS = 100_000
 
 
 # ---------- Helpers ----------
 def _model_file_for(contam: float) -> str:
-    return f"ransomware_model_c{contam:.4f}.joblib"
+    return os.path.join(BASE_DIR, f"ransomware_model_c{contam:.4f}.joblib")
+
 
 def _hash_field(field) -> str:
     return hashlib.sha256(SALT + str(field).encode()).hexdigest()[:8]
+
 
 def _pick(df: pd.DataFrame, *candidates: str) -> Optional[str]:
     for c in candidates:
         if c in df.columns:
             return c
     return None
+
 
 def _load_dataset_robust(path: str) -> pd.DataFrame:
     if not os.path.exists(path):
@@ -50,6 +57,7 @@ def _load_dataset_robust(path: str) -> pd.DataFrame:
     ip_src = _pick(df, 'Destination IP', 'Dst IP', 'Destination Address', 'Dst Addr', 'Destination IP Address')
     label_src = _pick(df, 'Label', 'Attack', 'Category')
 
+    # Time
     if time_src:
         df = df.rename(columns={time_src: 'Time'})
     else:
@@ -57,10 +65,12 @@ def _load_dataset_robust(path: str) -> pd.DataFrame:
         df['Time'] = start + pd.to_timedelta(np.arange(len(df)), unit='s')
         print("(!) No time column found. Using synthetic Time from row index.")
 
+    # Port
     if not port_src:
         raise KeyError(f"Could not find destination port column. Columns: {list(df.columns)[:25]}")
     df = df.rename(columns={port_src: 'Port'})
 
+    # Bytes
     if flow_bytes_rate_src:
         df = df.rename(columns={flow_bytes_rate_src: 'Netflow_Bytes'})
     else:
@@ -74,13 +84,17 @@ def _load_dataset_robust(path: str) -> pd.DataFrame:
                 f"Columns: {list(df.columns)[:25]}"
             )
 
+    # IP
     if ip_src and 'IPaddress' not in df.columns:
         df = df.rename(columns={ip_src: 'IPaddress'})
 
+    # Label → Prediction (optional)
     if label_src and 'Prediction' not in df.columns:
-        df['Prediction'] = df[label_src].apply(lambda x: 1 if str(x).strip().upper() == 'BENIGN' else 0)
+        df = df.rename(columns={label_src: 'Label'})
+        df['Prediction'] = df['Label'].apply(lambda x: 1 if str(x).strip().upper() == 'BENIGN' else 0)
 
     return df
+
 
 def _prepare_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -90,7 +104,6 @@ def _prepare_features(df: pd.DataFrame) -> pd.DataFrame:
     df['Netflow_Bytes'] = pd.to_numeric(df['Netflow_Bytes'], errors='coerce')
     df['Port'] = pd.to_numeric(df['Port'], errors='coerce')
 
-    # no chained assignment warnings
     for col in ['Netflow_Bytes', 'Port']:
         df[col] = df[col].replace([np.inf, -np.inf], np.nan)
 
@@ -103,31 +116,31 @@ def _prepare_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(subset=needed).reset_index(drop=True)
     return df
 
+
 def _load_or_train(df_hist: pd.DataFrame, contamination: float) -> Tuple[IsolationForest, StandardScaler]:
-    """
-    Load scaler & a model that matches 'contamination'. If not found, train new.
-    """
     model_file = _model_file_for(contamination)
 
-    scaler = None
+    # scaler
     if os.path.exists(SCALER_FILE):
-        scaler = joblib.load(SCALER_FILE)
-
-    if scaler is None:
+        scaler: StandardScaler = joblib.load(SCALER_FILE)
+        X_hist0 = scaler.transform(df_hist[FEATURES + ['file_entropy']])
+    else:
         scaler = StandardScaler()
         X_hist0 = scaler.fit_transform(df_hist[FEATURES + ['file_entropy']])
         joblib.dump(scaler, SCALER_FILE)
-    else:
-        X_hist0 = scaler.transform(df_hist[FEATURES + ['file_entropy']])
 
+    # model
     if os.path.exists(model_file):
-        model = joblib.load(model_file)
+        model: IsolationForest = joblib.load(model_file)
+        print(f"[LOAD] Loaded existing model: {model_file}")
         return model, scaler
 
     model = IsolationForest(contamination=contamination, random_state=42)
     model.fit(X_hist0)
     joblib.dump(model, model_file)
+    print(f"[TRAIN] Trained new model on {len(df_hist)} rows → {model_file}")
     return model, scaler
+
 
 def _append_cumulative_alerts(alerts: List[dict], total_new: int) -> None:
     if os.path.exists(LOG_FILE):
@@ -143,31 +156,55 @@ def _append_cumulative_alerts(alerts: List[dict], total_new: int) -> None:
 
 # ---------- Public API ----------
 def run_anomaly_detection(data_file: str, contamination: float = DEFAULT_CONTAM) -> pd.DataFrame:
-    """
-    Run the anomaly detector on a CIC-IDS2017-style CSV.
-      - contamination: float in (0, 0.5); typical 0.001–0.05
-      - Returns a DataFrame of anomalies with reasoning & hashed IDs
-      - Saves gdpr_audit_log.csv and updates cumulative_alerts.json
-    """
     if not (0 < contamination < 0.5):
         raise ValueError("contamination must be between 0 and 0.5")
 
+    # 1) load raw CSV
     df_raw = _load_dataset_robust(data_file)
-    if len(df_raw) > 50_000:  # sample for speed; remove to use full data
+    if len(df_raw) > 50_000:
         df_raw = df_raw.sample(n=50_000, random_state=42).reset_index(drop=True)
 
-    df = _prepare_features(df_raw)
+    # 2) load baseline if we have it
+    if os.path.exists(BASELINE_FILE):
+        df_hist = pd.read_csv(BASELINE_FILE)
+        print(f"[i] Loaded existing baseline from {BASELINE_FILE} with {len(df_hist)} rows.")
+        df_new = _prepare_features(df_raw)
+    else:
+        # build baseline from this CSV
+        if "Label" in df_raw.columns:
+            benign_mask = df_raw["Label"].astype(str).str.upper() == "BENIGN"
+            df_hist_raw = df_raw[benign_mask].copy()
+            if df_hist_raw.empty:
+                split = int(0.7 * len(df_raw))
+                df_hist_raw = df_raw.iloc[:split].copy()
+                df_new_raw = df_raw.iloc[split:].copy()
+                print("[i] Label column found but no BENIGN rows; using 70/30 split.")
+            else:
+                df_new_raw = df_raw.drop(df_hist_raw.index, errors="ignore").reset_index(drop=True)
+                print(f"[i] Using {len(df_hist_raw)} BENIGN rows for training baseline.")
+        else:
+            split = int(0.7 * len(df_raw))
+            df_hist_raw = df_raw.iloc[:split].copy()
+            df_new_raw = df_raw.iloc[split:].copy()
+            print("[i] No Label column; using first 70% for training baseline.")
 
-    split = int(0.7 * len(df))
-    df_hist = df.iloc[:split].copy()
-    df_new = df.iloc[split:].copy()
+        df_hist = _prepare_features(df_hist_raw)
+        df_new = _prepare_features(df_new_raw)
 
+    if df_hist.empty:
+        raise ValueError("No rows available for training the model (df_hist is empty).")
+
+    # 3) load/train model
     model, scaler = _load_or_train(df_hist, contamination)
 
+    # 4) detect anomalies on new data
     all_anoms = []
     cumul_alerts = []
     total_new = 0
-    run_num = (split // CHUNK_SIZE) + 1
+    run_num = 1
+
+    # we collect normals here → retrain once at the end
+    collected_normals = []
 
     for i in range(0, len(df_new), CHUNK_SIZE):
         chunk = df_new.iloc[i:i + CHUNK_SIZE].copy()
@@ -175,9 +212,10 @@ def run_anomaly_detection(data_file: str, contamination: float = DEFAULT_CONTAM)
             break
 
         X = scaler.transform(chunk[FEATURES + ['file_entropy']])
-        preds = model.predict(X)  # -1 anomaly, 1 normal
+        preds = model.predict(X)
         chunk.loc[:, 'anomaly'] = preds
 
+        # anomalies
         anoms = chunk[chunk['anomaly'] == -1].copy()
         if not anoms.empty:
             total_new += len(anoms)
@@ -190,9 +228,12 @@ def run_anomaly_detection(data_file: str, contamination: float = DEFAULT_CONTAM)
 
             def _reason(row):
                 r = []
-                if row['file_entropy'] > np.log(1e5): r.append("high entropy > log(1e5)")
-                if row['Port'] > 10000: r.append("high dest port >10000")
-                if row['Netflow_Bytes'] > 1e6: r.append("very high throughput >1e6 B/s")
+                if row['file_entropy'] > np.log(1e5):
+                    r.append("high entropy > log(1e5)")
+                if row['Port'] > 10000:
+                    r.append("high dest port >10000")
+                if row['Netflow_Bytes'] > 1e6:
+                    r.append("very high throughput >1e6 B/s")
                 return "; ".join(r) if r else "outlier pattern"
 
             anoms.loc[:, 'reasoning'] = anoms.apply(_reason, axis=1)
@@ -210,17 +251,44 @@ def run_anomaly_detection(data_file: str, contamination: float = DEFAULT_CONTAM)
                     'Prediction': int(row.get('Prediction')) if 'Prediction' in row else 'N/A'
                 })
 
+        # collect normals
+        normals = chunk[chunk['anomaly'] == 1].copy()
+        if not normals.empty:
+            collected_normals.append(normals)
+
         run_num += 1
         time.sleep(0.01)
 
-    anomalies_df = (pd.concat(all_anoms, ignore_index=True)
-                    if all_anoms else
-                    pd.DataFrame(columns=['Time','Time_numeric','Netflow_Bytes','Port','file_entropy',
-                                          'Time_hashed','ip_hashed','reasoning','Prediction','anomaly']))
+    # 5) single retrain at the end (only if we actually saw new normal data)
+    if collected_normals:
+        add_normals = pd.concat(collected_normals, ignore_index=True)
+        df_hist = pd.concat([df_hist, add_normals], ignore_index=True)
+        # keep it tidy
+        df_hist = df_hist.drop_duplicates().iloc[-MAX_BASELINE_ROWS:]
+        X_hist_new = scaler.transform(df_hist[FEATURES + ['file_entropy']])
+        model.fit(X_hist_new)
+        joblib.dump(model, _model_file_for(contamination))
+        df_hist.to_csv(BASELINE_FILE, index=False)
+        print(f"[RETRAIN] Final retrain with {len(add_normals)} new normal rows → baseline={len(df_hist)}")
+    else:
+        # stadig gem baseline, hvis vi havde en
+        df_hist.to_csv(BASELINE_FILE, index=False)
+
+    # 6) output
+    anomalies_df = (
+        pd.concat(all_anoms, ignore_index=True)
+        if all_anoms else
+        pd.DataFrame(columns=[
+            'Time', 'Time_numeric', 'Netflow_Bytes', 'Port', 'file_entropy',
+            'Time_hashed', 'ip_hashed', 'reasoning', 'Prediction', 'anomaly'
+        ])
+    )
 
     if not anomalies_df.empty:
-        cols = ['Time','Time_numeric','Netflow_Bytes','Port','file_entropy','Time_hashed','ip_hashed','reasoning']
-        if 'Prediction' in anomalies_df.columns: cols.append('Prediction')
+        cols = ['Time', 'Time_numeric', 'Netflow_Bytes', 'Port',
+                'file_entropy', 'Time_hashed', 'ip_hashed', 'reasoning']
+        if 'Prediction' in anomalies_df.columns:
+            cols.append('Prediction')
         cols = [c for c in cols if c in anomalies_df.columns]
         anomalies_df.to_csv(AUDIT_FILE, index=False, columns=cols)
 
@@ -243,7 +311,7 @@ if __name__ == "__main__":
     anoms = run_anomaly_detection(args.data_file, contamination=args.contam)
     print(f"Anomalies detected: {len(anoms)}")
     if not anoms.empty:
-        preview_cols = [c for c in ['Time','Port','Netflow_Bytes','reasoning'] if c in anoms.columns]
+        preview_cols = [c for c in ['Time', 'Port', 'Netflow_Bytes', 'reasoning'] if c in anoms.columns]
         print(anoms[preview_cols].head(20).to_string(index=False))
         print(f"\nSaved anonymized audit log → {AUDIT_FILE}")
         print(f"Updated cumulative log     → {LOG_FILE}")
