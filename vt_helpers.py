@@ -4,7 +4,7 @@ import pandas as pd
 def _detect_ip_col(df: pd.DataFrame):
     """
     Return the name of an IP column in df if present, else None.
-    Tries several common column names.
+    Tries several common column names, incl. the new 'dst_ip'.
     """
     for c in [
         "IPaddress",
@@ -14,6 +14,7 @@ def _detect_ip_col(df: pd.DataFrame):
         "Dst Addr",
         "Destination IP Address",
         "ip",
+        "dst_ip",   # new flow dataset
     ]:
         if c in df.columns:
             return c
